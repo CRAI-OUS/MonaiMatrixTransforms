@@ -17,8 +17,6 @@ Compose(
     ]
 )
 """
-from copy import deepcopy
-from enum import Enum
 from typing import Any, Dict, Hashable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -35,6 +33,8 @@ from monai.transforms.transform import MapTransform, RandomizableTransform
 from monai.transforms.transform import Randomizable, RandomizableTransform, ThreadUnsafe, Transform
 from monai.transforms.utils import create_grid
 from monai.utils import (
+    convert_to_dst_type,
+    convert_data_type,
     GridSampleMode,
     GridSamplePadMode,
     fall_back_tuple,
@@ -147,7 +147,7 @@ class MatRandTranslated(MapTransform):
                     raise ValueError(f"range should be a tuple or list of {dim} elements.")
                 for i in range(dim):
                     aff_mat[i, -1] = np.random.uniform(-self.range[i], self.range[i])     
-            elif isinstance(self.range, float):
+            elif isinstance(self.range, (int, float)):
                 aff_mat[:-1, -1] = np.random.uniform(-self.range, self.range, size=dim)
             d[key] = aff_mat@d[key]
         return d
@@ -219,6 +219,38 @@ class MatRandScale(MapTransform):
             d[key] = aff_mat@d[key]
         return d
 
+
+class MatRandFlip(MapTransform):
+    """
+    Applies a flip around a axis of an affine matrix.
+    Args:
+        keys: Keys to pick data for transformation.
+        axis: Axis to flip. If axis is None, an axis is chosen randomly.
+    """
+    def __init__(
+        self,
+        keys: KeysCollection,
+        axis: int = None,
+        prob: float = 0.5,
+        allow_missing_keys: bool = False,
+    ) -> None:
+        super().__init__(keys, allow_missing_keys)
+        self.axis = axis
+        self.prob = prob
+
+    def __call__(self, data: Mapping[Hashable, NdarrayOrTensor]) -> Dict[Hashable, NdarrayOrTensor]:
+        d = dict(data)
+        for key in self.key_iterator(d):
+            if np.random.rand() > self.prob:
+                continue
+            dim = d[key].shape[-1]-1
+            aff_mat = np.eye(dim + 1)
+            if self.axis is None:
+                self.axis = np.random.randint(dim)
+            aff_mat[self.axis, self.axis] = -1
+            d[key] = aff_mat@d[key]
+        return d
+
 class MatRandSheard(MapTransform):
     """
     Applies a random sheard to an affine matrix.
@@ -267,19 +299,17 @@ class MatRandRotationd(MapTransform):
         self,
         keys: KeysCollection,
         range: Optional[Union[Sequence[float], float]] = None,
-        img_key: KeysCollection = None,
         allow_missing_keys: bool = False,
     ) -> None:
         super().__init__(keys, allow_missing_keys)
         self.range = range
-        self.img_key = img_key
 
     def __call__(self, data: Mapping[Hashable, NdarrayOrTensor]) -> Dict[Hashable, NdarrayOrTensor]:
         d = dict(data)
         for key in self.key_iterator(d):
             dim = d[key].shape[-1]-1 # Dimension of the image to be transformed.
 
-            if self.range is None:
+            if self.range is None or np.abs(self.range - np.pi) < 0.1: 
                 rot_mat = self._uniform_random_rotation_mat(dim)
             else:
                 rot_mat = self._euler_random_rotation_mat(dim, self.range)
@@ -359,3 +389,115 @@ class MatRandRotationd(MapTransform):
         H = np.eye(3) - (2 * np.outer(v, v))
         M = -(H @ R)
         return M
+
+class RandGaussianNoise(RandomizableTransform):
+    """
+    Add Gaussian noise to image.
+
+    Args:
+        prob: Probability to add Gaussian noise.
+        mean: Mean or “centre” of the distribution.
+        std: Standard deviation (spread) of distribution.
+        dtype: output data type, if None, same as input image. defaults to float32.
+
+    """
+
+
+    def __init__(self, prob: float = 0.1, mean: float = 0.0, std: float = 0.1, mask_threshold: float = None, dtype: DtypeLike = np.float32) -> None:
+        RandomizableTransform.__init__(self, prob)
+        self.mean = mean
+        self.std = std
+        self.mask_threshold = mask_threshold
+        self.dtype = dtype
+        self.noise: Optional[np.ndarray] = None
+
+
+    def randomize(self, img: NdarrayOrTensor, mean: Optional[float] = None) -> None:
+        super().randomize(None)
+        if not self._do_transform:
+            return None
+        rand_std = self.R.uniform(0, self.std)
+        noise = self.R.normal(self.mean if mean is None else mean, rand_std, size=img.shape)
+        # noise is float64 array, convert to the output dtype to save memory
+        self.noise, *_ = convert_data_type(noise, dtype=self.dtype)  # type: ignore
+
+
+
+    def __call__(self, img: NdarrayOrTensor, mean: Optional[float] = None, randomize: bool = True) -> NdarrayOrTensor:
+        """
+        Apply the transform to `img`.
+        """
+        if randomize:
+            self.randomize(img=img, mean=self.mean if mean is None else mean)
+
+        if not self._do_transform:
+            return img
+
+        if self.noise is None:
+            raise RuntimeError("please call the `randomize()` function first.")
+        img, *_ = convert_data_type(img, dtype=self.dtype)
+        noise, *_ = convert_to_dst_type(self.noise, img)
+        if self.mask_threshold is not None:
+            mask = img >= self.mask_threshold
+            img[mask] = img[mask] + noise[mask]
+            mask = img >= self.mask_threshold
+            img[~mask] = 0.0
+        else:
+            img += noise
+        return img
+
+
+class RandGaussianNoised(RandomizableTransform, MapTransform):
+    """
+    Dictionary-based version :py:class:`monai.transforms.RandGaussianNoise`.
+    Add Gaussian noise to image. This transform assumes all the expected fields have same shape, if want to add
+    different noise for every field, please use this transform separately.
+
+    Args:
+        keys: keys of the corresponding items to be transformed.
+            See also: :py:class:`monai.transforms.compose.MapTransform`
+        prob: Probability to add Gaussian noise.
+        mean: Mean or “centre” of the distribution.
+        std: Standard deviation (spread) of distribution.
+        dtype: output data type, if None, same as input image. defaults to float32.
+        allow_missing_keys: don't raise exception if key is missing.
+    """
+    def __init__(
+        self,
+        keys: KeysCollection,
+        prob: float = 0.1,
+        mean: float = 0.0,
+        std: float = 0.1,
+        mask_threshold: float = None,
+        dtype: DtypeLike = np.float32,
+        allow_missing_keys: bool = False,
+    ) -> None:
+        MapTransform.__init__(self, keys, allow_missing_keys)
+        RandomizableTransform.__init__(self, prob)
+        self.rand_gaussian_noise = RandGaussianNoise(mean=mean, std=std, prob=1.0, mask_threshold=mask_threshold, dtype=dtype)
+
+
+    def set_random_state(
+        self, seed: Optional[int] = None, state: Optional[np.random.RandomState] = None
+    ) -> "RandGaussianNoised":
+        super().set_random_state(seed, state)
+        self.rand_gaussian_noise.set_random_state(seed, state)
+        return self
+
+
+
+    def __call__(self, data: Mapping[Hashable, NdarrayOrTensor]) -> Dict[Hashable, NdarrayOrTensor]:
+        d = dict(data)
+        self.randomize(None)
+        if not self._do_transform:
+            return d
+
+        # all the keys share the same random noise
+        first_key: Union[Hashable, List] = self.first_key(d)
+        if first_key == []:
+            return d
+
+        self.rand_gaussian_noise.randomize(d[first_key])  # type: ignore
+        for key in self.key_iterator(d):
+            d[key] = self.rand_gaussian_noise(img=d[key], randomize=False)
+        return d
